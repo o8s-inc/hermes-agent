@@ -613,6 +613,7 @@ class GatewayTurnMixin:
         approx_tokens: int
         msg_count: int
         warn_token_threshold: int
+        context_length: int = 0
 
     @staticmethod
     def _hmwa_hygiene_read_config(hs, data):
@@ -790,7 +791,10 @@ class GatewayTurnMixin:
                 _msg_count, f"{_approx_tokens:,}", _token_source,
                 int(hs.threshold_pct * 100), f"{_hyg_context_length:,}", f"{_compress_token_threshold:,}",
             )
-        return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold)
+        return self._HygienePlan(
+            _needs_compress, _approx_tokens, _msg_count, _warn_token_threshold,
+            int(_hyg_context_length or 0),
+        )
 
     async def _hmwa_hygiene_wait_for_summary(self, attempt, hs, session_entry):
         """Progress-aware inline wait for the detached hygiene compressor. Returns the compressed
@@ -1280,6 +1284,32 @@ class GatewayTurnMixin:
             _bind_hyg_state = getattr(getattr(_hyg_agent, "context_compressor", None), "bind_session_state", None)
             if callable(_bind_hyg_state):
                 _bind_hyg_state(_hyg_session_db, session_entry.session_id)
+            # Already past the window and a prior refusal (or a protected head/tail that
+            # fills it) means another summary cannot shrink this transcript. Do not start
+            # the detached wait — that ceiling is the multi-minute session death.
+            from agent.fallback_window_failfast import (
+                compression_cannot_shrink, failfast_message, over_model_window, tighten_hygiene_wait,
+            )
+            if over_model_window(plan.approx_tokens, plan.context_length):
+                if compression_cannot_shrink(_hyg_agent, _hyg_msgs):
+                    logger.warning(
+                        "Session hygiene: ~%s tokens already exceed the %s-token window for %s "
+                        "and compression cannot shrink the transcript; not waiting",
+                        f"{plan.approx_tokens:,}", f"{plan.context_length:,}", session_entry.session_id,
+                    )
+                    await self._hmwa_hygiene_notify(
+                        source, attempt.meta,
+                        failfast_message(_hyg_agent, plan.approx_tokens, window=plan.context_length),
+                        "context fail-fast",
+                    )
+                    return
+                # A summary that might still shrink keeps running, but a hang must not
+                # hold the turn out to hygiene_total_ceiling_seconds. Under-window
+                # hygiene (the 85% safety net) is not on this branch.
+                hs.timeout_seconds, hs.total_ceiling_seconds, hs.max_turn_hold_seconds = tighten_hygiene_wait(
+                    hs.timeout_seconds, hs.total_ceiling_seconds, hs.max_turn_hold_seconds,
+                    approx_tokens=plan.approx_tokens, context_length=plan.context_length,
+                )
             # Never finalize on close() — that would end the live gateway session row.
             _hyg_agent._end_session_on_close = False
             _hyg_agent._print_fn = lambda *a, **kw: None

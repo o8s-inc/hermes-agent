@@ -1466,6 +1466,10 @@ def _run_conversation_turn(
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
 
+    # One over-window fallback summary per turn. Durable would-grow strikes still
+    # fail fast; this latch only stops a second ceiling wait inside the same turn.
+    agent._fallback_over_window_compress_attempted = False
+
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
     try:
