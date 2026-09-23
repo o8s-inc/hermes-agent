@@ -17,7 +17,11 @@ from typing import Any, Dict, List, Optional
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-    compression_skipped_due_to_lock, conversation_history_after_compression,
+    compression_blocked_transiently, compression_skipped_due_to_lock,
+    conversation_history_after_compression,
+)
+from agent.fallback_window_failfast import (
+    fallback_compress_failed, failfast_message, prepare_fallback_compress,
 )
 
 logger = logging.getLogger("agent.turn_context")
@@ -351,6 +355,10 @@ def _run_preflight_passes(
     the loop's sites, default 3)."""
     from agent import turn_context as _tc
 
+    _block, _budget = prepare_fallback_compress(agent, out.messages, _preflight_tokens)
+    if _block:
+        raise _tc.PreflightCompressionTimedOut(_block)
+
     out.compressed = True
     # Compression is actually running — reset the dedup so a future blocked turn can
     # warn again.
@@ -378,10 +386,17 @@ def _run_preflight_passes(
         _preflight_input = out.messages
         _orig_len = len(_preflight_input)
         _orig_tokens = _preflight_tokens
+        _compress_kwargs = dict(approx_tokens=_preflight_tokens, task_id=effective_task_id)
+        if _budget is not None:
+            _compress_kwargs["failfast_budget_seconds"] = _budget
+            _budget = None
         out.messages, out.active_system_prompt = agent._compress_context(
-            _preflight_input, system_message, approx_tokens=_preflight_tokens,
-            task_id=effective_task_id,
+            _preflight_input, system_message, **_compress_kwargs,
         )
+        if out.messages is _preflight_input and (
+            compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+        ):
+            agent._fallback_over_window_compress_attempted = False
         if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
             # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
             # incompressibility — don't arm the blocker; stop passes this turn.
@@ -400,6 +415,10 @@ def _run_preflight_passes(
         _preflight_tokens = _tc._preflight_request_tokens(
             agent, out.messages, out.active_system_prompt or ""
         )
+        if fallback_compress_failed(agent, _preflight_tokens) and not (
+            out.messages is _preflight_input and compression_blocked_transiently(agent)
+        ):
+            raise _tc.PreflightCompressionTimedOut(failfast_message(agent, _preflight_tokens))
         if not _tc.compression_made_progress(
             _orig_len, len(out.messages), _orig_tokens, _preflight_tokens
         ):

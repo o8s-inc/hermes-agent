@@ -14,11 +14,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.context_engine import automatic_compaction_status_message
+from agent.fallback_window_failfast import (
+    fallback_compress_failed, fallback_window_exhausted_result, prepare_fallback_compress,
+)
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
 )
+from agent.model_metadata import estimate_request_tokens_rough
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
@@ -143,30 +147,55 @@ def run_preflight_compression(
         if _pre_api_status:
             agent._emit_status(_pre_api_status)
         v._last_preflight_pressure = request_pressure_tokens
-        _pre_api_input = v.messages
-        v.messages, v.active_system_prompt = agent._compress_context(
-            v.messages, system_message, approx_tokens=request_pressure_tokens,
-            task_id=effective_task_id,
-        )
-        if context_compression_timed_out(agent):
-            # Progress-aware timeout: never reached the provider — refund the
-            # call/budget and stop; an overflow retry would only re-compress.
+        _block, _budget = prepare_fallback_compress(agent, v.messages, request_pressure_tokens)
+        if _block:
             v.api_call_count = _refund_api_call(agent, v.api_call_count)
-            v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
-            v.failed = True
-            v._compression_timeout_exhausted = True
-            v._turn_exit_reason = "context_compression_timeout"
-            return _done("break")
-        if v.messages is _pre_api_input and (
+            return _done("return", fallback_window_exhausted_result(
+                agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
+            ))
+        _pre_api_input = v.messages
+        _compress_kwargs = dict(approx_tokens=request_pressure_tokens, task_id=effective_task_id)
+        if _budget is not None:
+            _compress_kwargs["failfast_budget_seconds"] = _budget
+        v.messages, v.active_system_prompt = agent._compress_context(
+            v.messages, system_message, **_compress_kwargs,
+        )
+        # A lock or cooldown skip is a defer, not proof the transcript cannot shrink.
+        # Judging it with the pre-compress token count would auto-reset the session.
+        _lock_or_transient = v.messages is _pre_api_input and (
             compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
-        ):
-            # Temporary DEFER (lock held / cooldown), not evidence about compressibility:
-            # refund the attempt, leave the progress blocker unarmed and proceed.
+        )
+        if _lock_or_transient:
+            agent._fallback_over_window_compress_attempted = False
             v.compression_attempts -= 1
             v._last_preflight_pressure = None
             if v.pending_moa_prepared_request is moa_prepared_request:
                 v.pending_moa_prepared_request = None
         else:
+            # Same list: refusal or no-op, still the measured pressure. A new list
+            # must be remeasured — the pre-compress count stays over the window
+            # even after a shrink that now fits.
+            _after_tokens = request_pressure_tokens
+            if v.messages is not _pre_api_input:
+                _after_tokens = estimate_request_tokens_rough(
+                    v.messages,
+                    system_prompt=v.active_system_prompt or system_message or "",
+                    tools=getattr(agent, "tools", None) or None,
+                )
+            if fallback_compress_failed(agent, _after_tokens):
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                return _done("return", fallback_window_exhausted_result(
+                    agent, v.messages, v.conversation_history, v.api_call_count, _after_tokens,
+                ))
+            if context_compression_timed_out(agent):
+                # Progress-aware timeout: never reached the provider — refund the
+                # call/budget and stop; an overflow retry would only re-compress.
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+                v.failed = True
+                v._compression_timeout_exhausted = True
+                v._turn_exit_reason = "context_compression_timeout"
+                return _done("break")
             _reset_retry_state_after_compaction(agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes
             # whole); in-place returns list(messages) — None would re-append
@@ -256,7 +285,6 @@ def compress_after_tool_results(
         _HANDOFF_SKIP_FINAL_RESPONSE, _midturn_request_pressure_tokens,
         _should_skip_model_call_for_reference_handoff,
     )
-    from agent.model_metadata import estimate_request_tokens_rough
 
     def _verdict(end_turn: bool) -> PostToolCompressionVerdict:
         return PostToolCompressionVerdict(

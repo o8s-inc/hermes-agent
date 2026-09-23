@@ -20,6 +20,9 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
 )
+from agent.fallback_window_failfast import (
+    fallback_compress_failed, failfast_message, prepare_fallback_compress,
+)
 from agent.error_classifier import FailoverReason
 from agent.message_sanitization import serialized_messages_bytes
 from agent.model_metadata import (
@@ -145,7 +148,9 @@ class _Recovery(OverflowVerdict):
             log=("%sContext compression failed after %d attempts.", self.agent.log_prefix, cap),
         )
 
-    def compress(self, request_tokens: int, *, fail_on_timeout: bool = False) -> Optional[OverflowVerdict]:
+    def compress(
+        self, request_tokens: int, *, fail_on_timeout: bool = False, failfast_budget_seconds: float = None,
+    ) -> Optional[OverflowVerdict]:
         """One compression pass with the summary-failure cooldown bypassed (the
         provider proved the request doesn't fit). Returns ``None`` when history was
         compressed, or a soft-defer verdict when another path holds the compression
@@ -159,9 +164,13 @@ class _Recovery(OverflowVerdict):
 
         agent = self.agent
         before = self.messages
+        compress_kwargs = dict(
+            approx_tokens=request_tokens, task_id=self.effective_task_id, bypass_cooldown=True,
+        )
+        if failfast_budget_seconds is not None:
+            compress_kwargs["failfast_budget_seconds"] = failfast_budget_seconds
         self.messages, self.active_system_prompt = agent._compress_context(
-            before, self.system_message, approx_tokens=request_tokens,
-            task_id=self.effective_task_id, bypass_cooldown=True,
+            before, self.system_message, **compress_kwargs,
         )
         if self.messages is before:
             deferred = None
@@ -172,10 +181,18 @@ class _Recovery(OverflowVerdict):
                     agent, self.messages, self.api_call_count, reason="transient_block",
                 )
             if deferred is not None:
+                # A lock or cooldown skip must not consume the one over-window attempt.
+                agent._fallback_over_window_compress_attempted = False
                 self.compression_attempts -= 1
                 agent._persist_session(self.messages, self.conversation_history)
                 return self.done("return", deferred)
-        if fail_on_timeout and context_compression_timed_out(agent):
+        if (
+            fail_on_timeout
+            and context_compression_timed_out(agent)
+            # Unchanged and still over a fallback window: the caller ends the turn
+            # with /new. A timeout that is not that case keeps the typed timeout.
+            and not (self.messages is before and fallback_compress_failed(agent, request_tokens))
+        ):
             return self.fail_turn(
                 _COMPRESSION_TIMEOUT_FINAL_RESPONSE, turn_exit_reason="context_compression_timeout"
             )
@@ -185,7 +202,7 @@ class _Recovery(OverflowVerdict):
         return None
 
     def compress_scored_by_tokens(
-        self, request_tokens: int, *, fail_on_timeout: bool = False,
+        self, request_tokens: int, *, fail_on_timeout: bool = False, failfast_budget_seconds: float = None,
     ) -> Tuple[Optional[OverflowVerdict], bool, int]:
         """``compress`` scored in message count / tokens (context-overflow errors ARE
         token-budget errors). Same-message-count compression (tool-result pruning,
@@ -195,7 +212,9 @@ class _Recovery(OverflowVerdict):
 
         original_len = len(self.messages)
         original_tokens = estimate_messages_tokens_rough(self.messages)
-        deferred = self.compress(request_tokens, fail_on_timeout=fail_on_timeout)
+        deferred = self.compress(
+            request_tokens, fail_on_timeout=fail_on_timeout, failfast_budget_seconds=failfast_budget_seconds,
+        )
         if deferred is not None:
             return deferred, False, original_tokens
         messages = self.messages
@@ -432,9 +451,17 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         tokens=st.approx_tokens, attempt=st.compression_attempts, cap=st.max_compression_attempts,
     ))
 
-    deferred, shrank, new_tokens = st.compress_scored_by_tokens(st.request_tokens(), fail_on_timeout=True)
+    _request_tokens = st.request_tokens()
+    _block, _budget = prepare_fallback_compress(agent, st.messages, _request_tokens)
+    if _block:
+        return st.fail_turn(_block)
+    deferred, shrank, new_tokens = st.compress_scored_by_tokens(
+        _request_tokens, fail_on_timeout=True, failfast_budget_seconds=_budget,
+    )
     if deferred is not None:
         return deferred
+    if fallback_compress_failed(agent, new_tokens):
+        return st.fail_turn(failfast_message(agent, new_tokens))
     st.approx_tokens = new_tokens
     if shrank or (new_ctx and new_ctx < old_ctx):
         time.sleep(2)  # Brief pause between compression retries
